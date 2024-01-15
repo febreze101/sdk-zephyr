@@ -10,14 +10,23 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
+#include "zephyr/arch/arm/irq.h"
+#include "zephyr/logging/log_ctrl.h"
+#include "zephyr/net/http/parser_state.h"
+#include "zephyr/sys/util.h"
+#include <stdint.h>
 #include <zephyr/logging/log.h>
 LOG_MODULE_REGISTER(net_websocket, CONFIG_NET_WEBSOCKET_LOG_LEVEL);
 
 #include <zephyr/kernel.h>
 #include <strings.h>
+#include <string.h>
 #include <errno.h>
 #include <stdbool.h>
 #include <stdlib.h>
+#include <stdio.h>
+#include <ctype.h>
+#include <string.h>
 
 #include <zephyr/sys/fdtable.h>
 #include <zephyr/net/net_core.h>
@@ -47,6 +56,26 @@ LOG_MODULE_REGISTER(net_websocket, CONFIG_NET_WEBSOCKET_LOG_LEVEL);
 #define HEXDUMP_SENT_PACKETS 0
 #define HEXDUMP_RECV_PACKETS 0
 
+#define HTTP_STR	"HTTP"
+#define GET_STR		"GET"
+
+#define upgrade_str		"upgrade"
+#define websocket_str		"websocket"
+
+#define host_field_str 		"Host:"
+#define upgrade_field_str	"Upgrade:"
+#define response_upgrade_str "Upgrade"
+#define connection_field_str	"Connection:"
+#define sec_ws_ver_field_str	"Sec-WebSocket-Version:"
+#define sec_ws_key_field_str	"Sec-WebSocket-Key:"
+#define sec_ws_accept_field_str	"Sec-WebSocket-Accept: "
+#define bad_request_field_str "Bad Request"
+#define switching_protocol_str "HTTP/1.1 101 Switching Protocols"
+
+#define sec_ws_accept_str ""
+
+#define MAX_HTTP_HEADER_SIZE	1700
+
 static struct websocket_context contexts[CONFIG_WEBSOCKET_MAX_CONTEXTS];
 
 static struct k_sem contexts_lock;
@@ -55,6 +84,33 @@ static const struct socket_op_vtable websocket_fd_op_vtable;
 
 #if defined(CONFIG_NET_TEST)
 int verify_sent_and_received_msg(struct msghdr *msg, bool split_msg);
+#endif
+
+static const char http_400_bad_req[] = {
+	"HTTP/1.1 400 Bad Request\r\n"
+	"Content-Type: text/plain\r\n"
+	"Content-Length: 11\r\n"
+	"\r\n"
+	"Bad Request\r\n"
+	"\r\n"
+};
+
+static char ws_handshake_response_format[] = {
+	"HTTP/1.1 101 Switching Protocols\r\n"
+	"Upgrade: websocket\r\n"
+	"Connection: Upgrade\r\n"
+	"Sec-WebSocket-Accept: %s\r\n"
+	"\r\n"
+};
+
+static  char ws_handshake_response[150];
+
+// uint8_t dst_buffer[512];
+
+// sprintf(dst_buffer,ws_handshake_response, "hi" )
+
+#if !defined(CONFIG_NET_TEST)
+static int sendmsg_all(int sock, const struct msghdr *message, int flags);
 #endif
 
 static const char *opcode2str(enum websocket_opcode opcode)
@@ -404,6 +460,145 @@ out:
 	return ret;
 }
 
+static int websocket_server_http_handshake(struct websocket_server *srv,
+					   struct websocket_context *ctx)
+{
+	int ret = 0;
+	volatile int ws_ret = 0;
+	static ssize_t conn_cnt = 0;
+
+	// uint8_t ping = ctx->parser_state;
+
+	websocket_http_handshake_header *hh = &ctx->hs_header;
+	memset(hh, 0, sizeof(websocket_http_handshake_header));
+
+	while(true) {
+		ret = zsock_recv(ctx->real_sock, ctx->recv_buf.buf,
+				 ctx->recv_buf.size, 0);
+		if (ret < 0) {
+			LOG_ERR("Failed to recieve on socket %d with error: %d",
+				ctx->real_sock, errno);
+			zsock_close(ctx->real_sock);
+			return -errno;
+		}
+
+		// Parse http handshake:
+		websocket_parse_client_http_handshake(
+			(const char*)ctx->recv_buf.buf, hh);
+
+		//
+
+		// Interpret http request:
+		ws_ret = websocket_interpret_request(hh);
+
+		conn_cnt++;  // increase connection counter if succeed
+		break;  // ToDo: must be covered by final body check!
+	}
+
+
+	// Send websocket response if a connection has been made and http 400 bad request otherwise:
+	struct msghdr msg;
+	struct iovec msg_iov[1];
+	
+	if (ws_ret > 0) {
+		ret = send(ctx->real_sock, ws_handshake_response, strlen(ws_handshake_response), 0);
+
+		// memset(&msg, 0, sizeof(struct msghdr));
+		// msg_iov[0].iov_base = (char*)ws_handshake_response;
+		// msg_iov[0].iov_len =strlen(ws_handshake_response);
+
+		// msg.msg_iov = msg_iov;
+		// msg.msg_iovlen = ARRAY_SIZE(ws_handshake_response);
+
+		// ret = sendmsg_all(ctx->real_sock, &msg, MSG_WAITALL);
+	} else {
+		memset(&msg, 0, sizeof(struct msghdr));
+		msg_iov[0].iov_base = (char*)http_400_bad_req;
+		msg_iov[0].iov_len = ARRAY_SIZE(http_400_bad_req) - 1;
+
+		msg.msg_iov = msg_iov;
+		msg.msg_iovlen = ARRAY_SIZE(msg_iov);
+
+		ret = sendmsg_all(ctx->real_sock, &msg, MSG_WAITALL);
+	}
+
+	
+	return ret;
+}
+
+int websocket_accept(int sock, struct websocket_server *srv, int32_t timeout,
+		     void *user_data)
+{
+	int ret = 0;
+	const int nfds = 1;
+	struct zsock_pollfd fds;
+	struct websocket_context *ctx;
+
+	fds.events = ZSOCK_POLLIN;
+
+	if (sock < 0 || srv == NULL || srv->host == NULL || srv->url == NULL) {
+		return -EINVAL;
+	}
+
+	ctx = websocket_find(sock);
+	if (ctx) {
+		NET_DBG("[%p] Websocket for sock %d already exists!", ctx,
+			sock);
+		return -EEXIST;
+	}
+
+	ctx = websocket_get();
+	if (!ctx) {
+		return -ENOENT;
+	}
+
+	// if(srv->host != NULL) {
+	// 	// ToDo: No handshake shall be done by this server - just return new
+	// 	// Websocket (RFC6455, p.20, section 4.2)
+	// 	// ToDo: define proper fd and return
+	// 	LOG_DBG("---> srv->host is not NULL exit with fd: %d", fd);
+	// 	return fd;
+	// }
+
+	// ret = zsock_poll(&fds, nfds, timeout);
+	// if (ret < 0) {
+	// 	LOG_ERR("poll read event error: %d", errno);
+	// 	zsock_close(fds.fd);
+	// 	return -errno;
+	// }
+
+	// if ((fds.revents & ZSOCK_POLLERR) || (fds.revents & ZSOCK_POLLNVAL)) {
+	// 	LOG_ERR("Receiver socket poll error: %d", errno);
+	// 	zsock_close(sock);
+	// 	return -errno;
+	// }
+
+	ctx->addrlen = sizeof(struct sockaddr);
+	fds.fd = zsock_accept(sock, (struct sockaddr *)&ctx->client_addr, &ctx->addrlen);
+	if (fds.fd < 0) {
+		LOG_ERR("Receiver accept error: %d", -errno);
+		zsock_close(sock);
+		return -errno;
+	}
+
+	ctx->real_sock = fds.fd;
+	ctx->recv_buf.buf = srv->tmp_buf;
+	ctx->recv_buf.size = srv->tmp_buf_len;
+
+	ret = websocket_server_http_handshake(srv, ctx);
+
+	return ctx->real_sock;
+}
+
+void websocket_sockaddr(int sock, struct sockaddr* addr, socklen_t *addrlen)
+{
+	struct websocket_context* ctx = websocket_find(sock);
+	k_sem_take(&contexts_lock, K_FOREVER);
+	memcpy((void*)addrlen, (void*)&ctx->addrlen, sizeof(socklen_t));
+	memcpy((void*)addr, (void*)&ctx->client_addr, sizeof(struct sockaddr));
+	k_sem_give(&contexts_lock);
+}
+
 int websocket_disconnect(int ws_sock)
 {
 	return close(ws_sock);
@@ -636,7 +831,8 @@ int websocket_send_msg(int ws_sock, const uint8_t *payload, size_t payload_len,
 		return -EINVAL;
 	}
 
-	ctx = z_get_fd_obj(ws_sock, NULL, 0);
+	// ctx = z_get_fd_obj(ws_sock, NULL, 0);
+	ctx = websocket_find(ws_sock);
 	if (ctx == NULL) {
 		return -EBADF;
 	}
@@ -752,7 +948,7 @@ static uint32_t websocket_opcode2flag(uint8_t data)
 static int websocket_parse(struct websocket_context *ctx, struct websocket_buffer *payload)
 {
 	int len;
-	uint8_t data;
+	volatile uint8_t data;
 	size_t parsed_count = 0;
 
 	do {
@@ -931,7 +1127,8 @@ int websocket_recv_msg(int ws_sock, uint8_t *buf, size_t buf_len,
 
 	ctx = test_data->ctx;
 #else
-	ctx = z_get_fd_obj(ws_sock, NULL, 0);
+	// ctx = z_get_fd_obj(ws_sock, NULL, 0);
+	ctx = websocket_find(ws_sock);
 	if (ctx == NULL) {
 		return -EBADF;
 	}
@@ -1001,7 +1198,7 @@ int websocket_recv_msg(int ws_sock, uint8_t *buf, size_t buf_len,
 				*remaining = ctx->parser_remaining;
 			}
 			if (message_type != NULL) {
-				*message_type = ctx->message_type;
+ 				*message_type = ctx->message_type;
 			}
 
 			size_t left = ctx->recv_buf.count - parsed_count;
@@ -1162,4 +1359,193 @@ void websocket_context_foreach(websocket_context_cb_t cb, void *user_data)
 void websocket_init(void)
 {
 	k_sem_init(&contexts_lock, 1, K_SEM_MAX_LIMIT);
+}
+
+void str_tolower(char* str)
+{
+	for (int i = 0; str[i] != '\0'; i++) {
+		str[i] = tolower(str[i]);
+	}
+}
+
+void copy_substr(char* src, char* dst, size_t dst_len, const char end_char) {
+	const char* sub_str_end = strchr(src + 1, end_char);
+	const size_t sub_str_len = sub_str_end - src;
+	memcpy(dst, src, MIN(sub_str_len, dst_len));
+}
+
+bool find_field_lower(char* str, size_t field_name_len,
+			const char* field_val, size_t field_val_len) {
+	const size_t field_name_offset = field_name_len;
+	const size_t field_len = MAX(strlen(str + field_name_offset),
+					field_val_len);
+	str_tolower(str + field_name_offset);
+	int ret = -1;
+	void* p = str + field_name_offset;
+	while(ret != 0) {
+	ret = strncmp(p, field_val, field_len);
+	p = UINT_TO_POINTER(POINTER_TO_UINT(p) + 1);
+	if((*(char*)p) == '\n' || (*(char*)p) == '\r' || p == NULL) {
+		break;
+	}
+	}
+	return ret == 0;
+}
+
+size_t websocket_parse_client_http_handshake(const char *request,
+				websocket_http_handshake_header *hh)
+{
+	size_t bytes_cnt = 0;
+	char buffer[MAX_HTTP_HEADER_SIZE] = {0};
+	const char* last_char = strstr(request, "\r\n\r\n");
+	const size_t header_len = last_char - request;
+	char* saveptr = NULL;
+	if (header_len >= MAX_HTTP_HEADER_SIZE) {
+		errno = -ENOBUFS;
+		LOG_ERR("Header size exceeds maximum allowed size of %d",
+			MAX_HTTP_HEADER_SIZE);
+		return bytes_cnt;
+	}
+
+	strncpy(buffer, request, header_len);
+
+	
+	char *line = strtok_r(buffer, "\r\n", &saveptr);
+	bytes_cnt += strlen(line) + sizeof("\r\n") - 1;
+	while (line != NULL) {
+		// LOG_DBG("bytes_cnt: %d, line: [%s] saveptr: [%s]",
+		// 	bytes_cnt, line, saveptr);
+		if (strncmp(line, GET_STR, sizeof(GET_STR) - 1) == 0) {
+			// Parse path:
+			copy_substr(line + strlen(GET_STR) + 1, hh->path,
+				    sizeof(hh->path), ' ');
+
+			// Parse HTTP version:
+			const char* version = line + strlen(GET_STR) + 1
+					+ strlen(hh->path) + 1
+					+ strlen(HTTP_STR) + 1;
+			hh->http_version_major = atoi(version);
+			hh->http_version_minor = atoi(strchr(version, '.') + 1);
+		} else if (strncmp(line, upgrade_field_str,
+				   sizeof(upgrade_field_str) - 1) == 0) {
+			hh->upgrade_websocket = find_field_lower(line,
+							sizeof(upgrade_field_str),
+							websocket_str,
+							sizeof(websocket_str) - 1);
+		} else if (strncmp(line, connection_field_str,
+				   sizeof(connection_field_str) - 1) == 0) {
+			hh->connection_upgrade = find_field_lower(line,
+							sizeof(connection_field_str),
+							upgrade_str,
+							sizeof(upgrade_str) - 1);
+		} else if (strncmp(line, sec_ws_ver_field_str,
+				   sizeof(sec_ws_ver_field_str) - 1) == 0) {
+			hh->sec_websocket_version = atoi(line
+						+ sizeof(sec_ws_ver_field_str));
+		} else if (strncmp(line, host_field_str,
+				   sizeof(host_field_str) - 1) == 0) {
+			copy_substr(line + sizeof(host_field_str), hh->host,
+				    sizeof(hh->host), ' ');
+		} else if (strncmp(line, sec_ws_key_field_str,
+				   sizeof(sec_ws_key_field_str) - 1) == 0) {
+			copy_substr(line + sizeof(sec_ws_key_field_str),
+				hh->sec_websocket_key,
+				sizeof(hh->sec_websocket_key), '\r');
+			hh->sec_websocket_key_cnt++;
+		}
+
+		line = strtok_r(NULL, "\r\n", &saveptr);
+		bytes_cnt += line ? strlen(line) : 0;
+		bytes_cnt += sizeof("\r\n") - 1;
+	}
+
+	hh->final = true;
+	return bytes_cnt;
+}
+
+/*
+ * Interpret the http request and return 1 if upgrade to websocket is successful and 0 otherwise.
+*/
+#define SEC_WEBSOCKET_KEY_LEN 24
+int websocket_interpret_request(websocket_http_handshake_header *hh) {
+	int ret = 0;
+	size_t olen = 0;
+	char sec_ws_key[SEC_WEBSOCKET_KEY_LEN];
+	char key_to_hash[SEC_WEBSOCKET_KEY_LEN + sizeof(WS_MAGIC) - 1];
+	char sec_accept_key[MAX_SEC_ACCEPT_LEN];
+	char hash_str[20];
+	volatile int encoding_ret = 0;
+
+	memset(sec_ws_key, 0, sizeof(sec_ws_key));
+	memset(key_to_hash, 0, sizeof(key_to_hash));
+	memset(sec_accept_key, 0, sizeof(sec_accept_key));
+
+	memcpy(sec_ws_key, hh->sec_websocket_key, sizeof(sec_ws_key));
+
+	memcpy(key_to_hash, sec_ws_key, SEC_WEBSOCKET_KEY_LEN);
+
+	strcat(key_to_hash, WS_MAGIC);
+
+	mbedtls_sha1(key_to_hash, sizeof(key_to_hash), hash_str);
+	encoding_ret = base64_encode(sec_accept_key, sizeof(sec_accept_key), &olen, hash_str, WS_SHA1_OUTPUT_LEN);
+
+
+
+	// strcat(ws_handshake_response, sec_accept_key);
+	
+	// strcpy(sec_ws_accept_str, sec_accept_key);
+
+	// check for version 1.1
+	if (hh->http_version_major == 0x1 && hh->http_version_minor >= 0x1) {
+		ret = 1;
+	} else {
+		return 0;
+	}
+
+	//check that upgrade are true
+	if (hh->upgrade_websocket) {
+		ret = 1;
+	} else {
+		return 0;
+	}
+
+	// check that connenction are true
+	if (hh->connection_upgrade) {
+		ret = 1;
+	} else {
+		return 0; 
+	}
+
+	// check that sec_websocket_version is 13 (0xd)
+	if (hh->sec_websocket_version == 0xd) {
+		ret = 1;
+	} else {
+		return 0;
+	}
+
+	// check path
+	if (strncmp(hh->path, "/", 1)== 0) {
+		ret = 1;
+	} else {
+		return 0;
+	}
+
+	// check and process the key 
+	if (encoding_ret == 0) {
+		sprintf(ws_handshake_response, ws_handshake_response_format, sec_accept_key);
+		ret = 1;
+	}  else {
+		return 0;
+	}
+
+
+	// check that final is true
+	if (hh->final) {
+		ret = 1;
+	} else {
+		return 0;
+	}
+
+	LOG_INF("%s", ws_handshake_response);
+	return 1;
 }
